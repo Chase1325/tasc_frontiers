@@ -7,7 +7,7 @@ from scipy.sparse.csgraph import shortest_path
 from scipy.sparse import csr_matrix
 from torch._C import device, dtype
 import plotly.graph_objects as go
-
+from gpytorch.kernels import ScaleKernel, RBFKernel
 
 class Environment(object):
     def __init__(self, f, domain, res, start, goal, connection=8, device='cpu'):
@@ -16,42 +16,60 @@ class Environment(object):
         #Field specific
         self.domain = domain
         self.res = res
+        self.f_func = f
         self.dp = (self.domain[1]-self.domain[0])/(self.res-1)
         self.create_wsp()
-        self.create_field(f)
+        self.create_field(self.f_func)
+        self.create_covariance()
+        self.est_f = torch.zeros_like(self.field, device=torch.device(self.device))
         self.s = self.get_closest_idx(start)
         self.g = self.get_closest_idx(goal, True)
+        
 
         #Create initial paths and vars
         self.idvec = torch.zeros(self.res**2, dtype=torch.int8, device=torch.device(self.device))
 
         #Graph and Plan
-        self.create_adjMat(connection) 
+        self.create_adjMat(connection)
         self.path_plan()
 
+    '''Determine the closest workspace vertex for the point'''
     def get_closest_idx(self, x, goal=False):
         if goal:
             self.dvec = torch.cdist(self.wsp, torch.tensor([x], dtype=torch.float64, device=torch.device(self.device)))
             return torch.argmin(self.dvec)
         else:
             return torch.argmin(torch.cdist(self.wsp, torch.tensor([x], dtype=torch.float64, device=torch.device(self.device))))
+
+    '''Generate the Initial Workspace'''
     def create_wsp(self):
         x = torch.linspace(self.domain[0], self.domain[1], self.res, dtype=torch.float64, device=torch.device(self.device))
         gx, gy = torch.meshgrid(x, x)
         self.wsp = torch.column_stack((gx.ravel(), gy.ravel()))
 
+    '''Create the true field given the field function'''
     def create_field(self, f):
         self.field = f(self.wsp, device=self.device)
 
-    def create_adjMat(self, connection=8):
+    '''Initialize the threat covariance matrix'''
+    def create_covariance(self):
+        kern = ScaleKernel(RBFKernel())
+        kern.base_kernel.lengthscale = 1
+        kern.outputscale = 100
+        self.cov = kern.forward(self.wsp, self.wsp)
 
+    '''Set the threat covariance matrix'''
+    def set_covariance(self, cov):
+        self.cov = cov
+
+    '''Create an adjacency matrix of the workspace in either 4 or 8 connection scheme'''
+    def create_adjMat(self, connection=8):
         if connection==4:
             d1 = np.tile(np.append(np.ones(self.res-1, dtype=np.float64), [0]), self.res)[:-1]
             d2 = np.ones(self.res*(self.res-1), dtype=np.float64)
             upper_diags = s.diags([d1, d2], [1, self.res])
             adjMat = (upper_diags + upper_diags.T).toarray()
             self.adjMat = torch.from_numpy(adjMat).to(self.device)*self.dp
-
         if connection==8:
             d1 = np.tile(np.append(np.ones(self.res-1), [0]), self.res)[:-1]
             d2 = np.append([0], np.sqrt(2)*d1[:self.res*(self.res-1)])
@@ -61,31 +79,35 @@ class Environment(object):
             adjMat = (upper_diags + upper_diags.T).toarray()
             self.adjMat = torch.from_numpy(adjMat).to(self.device)*self.dp
 
-    def path_plan(self, est_path=False):
-        
-
+    '''Get the True/Est path costs'''
+    def path_cost(self, est_path=False):
         if not est_path:
+            self.true_cost = torch.mm(self.p_true.t(), self.field).item()
+        else:
+            self.est_cost = torch.mm(self.p_est.t(), self.est_f).item()
+
+    '''Get the estimated path variance'''
+    def get_path_var(self):
+        self.var_p = torch.mm(self.p_est.t(), torch.mm(self.cov, self.p_est))
+        return self.var_p.item()
+
+    '''Find the True/Est path plans'''
+    def path_plan(self, isEst=False):
+        if not isEst:
             weightVec = 1e-16*self.dvec + self.field
             fieldweight = self.adjMat  * (weightVec + weightVec.t())*0.5
 
             if self.device == 'cuda':
                 f_cpu = fieldweight.cpu().numpy()
                 g = self.g.cpu().numpy()
-                path_cost, predecesors = shortest_path(csr_matrix(f_cpu), method="D", directed=False, indices=g, return_predecessors=True)
+                _, predecesors = shortest_path(csr_matrix(f_cpu), method="D", directed=False, indices=g, return_predecessors=True)
             else:
-                path_cost, predecesors = shortest_path(csr_matrix(fieldweight), method="D", directed=False, indices=self.g, return_predecessors=True)
-            self.incidenceVec = torch.zeros(self.res**2)
-
-            if est_path:
-                self.est_cost = path_cost[self.s]*self.dp
-            else:
-                self.path_cost = path_cost[self.s]*self.dp
+                _, predecesors = shortest_path(csr_matrix(fieldweight), method="D", directed=False, indices=self.g, return_predecessors=True)
             
             #Path Incidence (weighted for diagonals)
             self.p_true = torch.zeros_like(self.field, device=torch.device(self.device))
             indx = self.s.item()
             v = [indx]
-            #jndx = predecesors[indx]
             while indx != self.g:
                 jndx = predecesors[indx].item()
                 delta = self.adjMat[indx][jndx]
@@ -94,9 +116,32 @@ class Environment(object):
                 indx = jndx
         
             self.v_true = torch.tensor(v, device=torch.device(self.device))
-    
-
+            self.path_cost(isEst)
         
+        else:
+            weightVec = 1e-16*self.dvec + self.est_f
+            fieldweight = self.adjMat  * (weightVec + weightVec.t())*0.5
+
+            if self.device == 'cuda':
+                f_cpu = fieldweight.cpu().numpy()
+                g = self.g.cpu().numpy()
+                _, predecesors = shortest_path(csr_matrix(f_cpu), method="D", directed=False, indices=g, return_predecessors=True)
+            else:
+                _, predecesors = shortest_path(csr_matrix(fieldweight), method="D", directed=False, indices=self.g, return_predecessors=True)
+
+            self.p_est = torch.zeros_like(self.field, device=torch.device(self.device))
+            indx = self.s.item()
+            v = [indx]
+            while indx != self.g:
+                jndx = predecesors[indx].item()
+                delta = self.adjMat[indx][jndx]
+                self.p_est[[indx, jndx]] += delta*0.5
+                v.append(jndx)
+                indx = jndx
+            self.v_est = torch.tensor(v, device=torch.device(self.device))
+            self.path_cost(isEst)
+
+    
         #print(torch.mm(self.field.t(), (self.p_true)))
         '''
         # Trial Get path and plot on surface
@@ -127,7 +172,6 @@ class Environment(object):
         fig.show()
         '''
         
-
     def print_pretty(self):
         print(" Domain: {}\n Resolution: {}\n Start: {} @ {}\n Goal: {} @ {}\n".format(self.domain, 
                                                                                        self.res, 

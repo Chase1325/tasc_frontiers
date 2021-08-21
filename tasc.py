@@ -7,6 +7,7 @@ import torch
 from scipy.sparse.csgraph import shortest_path, dijkstra
 from scipy.sparse import csr_matrix
 from torch._C import StringType, device
+from gpytorch.kernels import ScaleKernel, RBFKernel
 
 #from Methods.Utility import createGoals, getPathVar, encapsulateData, getStats, maskField
 import Models.func_defs as fds
@@ -23,34 +24,29 @@ from Models.environment import Environment
 
 np.set_printoptions(suppress=True)
 
-def TASC(E, S, G, i_s, i_g, eps, visualize=False, method='direct', doCluster=False):
-
-    startTime = time.time()
-
-    #Initialize Variables
-    f = np.zeros(E.Ng)                              # Estimated threat field
-    P = np.eye(E.Ng)*10000
-    #P = np.diag(np.random.rand(E.Ng))*10000         # Covariance Matrix
-    I = np.array([], dtype=np.int16)                # Identified vertices
-    X_k = o_k = n_k = B_ = B_n = B_o = None
+def TASC(E, eps=1.0):
+    #Performance params
     iteration = 0
-    observations = 0
-    identified = False
 
-    #Find true best path
-    pi_t, path_t, Ex_t, _ = opt_path(E, E.true_field)
+    #Find initial path and variance
+    E.path_plan(isEst=True)
+    VAR_p = E.get_path_var()
 
-    #Find initial path
-    s_time = time.time()
-    pi_s, path_s, Ex_s, _ = opt_path(E, E.workspace, heuristic='distance')
-    print(time.time()-s_time)
+    while (VAR_p > eps):
+        #Find Optimal Sensor Coordination
+        #S.OPTIMIZE(E)
 
-    #Find initial path variance
-    VAR_path = getPathVar(pi_s, P, E.dp)
+        #S.go to nearest optimized location
 
-    while (VAR_path > eps) or not identified:
+        #S.gather data + combine with past id verts
+
+        #E.fit_data + update estimates
+
+        #
+
+
+
         #Find Sensor Configurations and make observations
-        s_time = time.time()
         iterations = S.SENSOR_CONFIG(E, f, P, pi_s, path_s, E.dp, term=eps, id=I, method=method, alts=E.alts, doCluster=doCluster)
         print('Sensor Config', time.time()-s_time)
         x, y, noise, obs, I_k, Beta, Beta_n, Beta_o = S.getMeasurements(E.threat_field, E.workspace)
@@ -60,7 +56,6 @@ def TASC(E, S, G, i_s, i_g, eps, visualize=False, method='direct', doCluster=Fal
         X_k, o_k, n_k, B_, B_o, B_n, I = encapsulateData(x, y, noise, obs, I_k, Beta, Beta_n, Beta_o,
                                                          X_k=X_k, o_k=o_k, n_k=n_k, B_=B_, B_n=B_n, B_o=B_o, I=I)
         
-
         #Find Field and Covariance Matrix with GPR
         train_pt = np.concatenate((X_k, B_), axis=0)
         train_label = np.concatenate((o_k, B_o))
@@ -127,8 +122,6 @@ if __name__ == "__main__":
     #parser.add_argument('--offset', type=float, default=1.0, help='threat field offset (must be strictly positive)')
 
     parser.add_argument('--device', type=str, default='cpu')
-    
-    
     #parser.add_argument('--method', type=str, default='direct', help='CSCP strategy to use [direct, depth, breadth]')
     #parser.add_argument('--cluster', type=int, default=0, help='Perform clustering instead of direct optimization for sensor configuration')
     
@@ -137,30 +130,13 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     start = time.time()
-    E = Environment(fds.eggholder, args.domain, args.res, args.start, args.goal, device=args.device)
-    E.path_plan()
-    E.path_plan()
+    E = Environment(fds.bird, args.domain, args.res, args.start, args.goal, device=args.device)
     print(time.time()-start)
 
-    start = time.time()
-    for i in range(10):
-        E.path_plan()
-    print(time.time()-start)
-
-    #i_s, i_g = createGoals((args.start), (args.goal), res=args.res, size=args.size, seed=args.seed)
+    TASC(E, eps=args.eps)
     '''
-    c = GaussThreatField(Np=args.Np, offset=args.offset, intensity=args.intensity, size=args.size, seed=args.seed)
-    E = Environment((args.size, args.size), args.res, c, offset=args.offset, alts=args.alts, start=i_s, goal=i_g)
-    G = createCompact2DGraph(E.workspace)
     S = SensorNetwork(args.Ns)
-    E.graph = G
-    #print(i_s, i_g)
-    #print(args.cluster)
 
-    #viz.draw_env_3d(E)
-    #Find true best path
-    #pi_t, path_t, Ex_t, _ = opt_path(E, E.true_field)
-    #viz.draw_env_2d(E, draw_workspace=True, true_path=path_t)
     iters, obs, E_err, Inc_err, I_per, runtime = TASC(E, S, G, i_s, i_g, args.eps, args.viz, method=args.method, doCluster=args.cluster)
     print('{} Iters; {} Placements; {} Est-err; {} Inc-err; {} Id; {} secs;'.format(iters, obs, E_err, Inc_err, I_per, runtime))
     '''
